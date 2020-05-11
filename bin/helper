@@ -1,0 +1,102 @@
+#!/bin/bash
+set -eu
+BASEDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && cd .. && pwd )"
+COMMANDS="init export import"
+
+rand_chars() {
+	openssl rand -base64 64 | perl -E 'local $/; $_=<>; s#\n#_#g;s#/#.#g;s#/#!#g; for my $c(1..'$1') { print substr($_,$c,1_) }; say ""'
+}
+
+generate_env() {
+	ENV_FILENAME="$BASEDIR/.env"
+
+	if [ -e "$ENV_FILENAME" ]; then
+		echo "$ENV_FILENAME already exists."
+		return
+	fi
+
+	DB_NAME="wordpress"
+	DB_USER="wordpress"
+	DB_PASS="$( rand_chars 32 )"
+	MYSQL_ROOT_PASSWORD="$( rand_chars 32 )"
+
+	cat > "$ENV_FILENAME" << EOS
+DB_USER=$DB_USER
+DB_PASS=$DB_PASS
+DB_NAME=$DB_NAME
+MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
+EOS
+	echo "Write: $ENV_FILENAME"
+}
+
+get_project_name() {
+	SERVICE_NAME=mysql \
+		perl -E 'my $id=`docker-compose ps -q $ENV{SERVICE_NAME}`; chomp $id; my $ps=`docker ps --format={{.Names}} --filter="id=$id"`; chomp $ps;say $1 if($ps=~/^(.+)_$ENV{SERVICE_NAME}_\d+$/)' 
+}
+
+enable_mysql_root() {
+	ENV_FILENAME="$BASEDIR/.env"
+	eval $( cat "$ENV_FILENAME" | perl -nlE 'say "local $1=$2" if(/^([^=]+)=(.+)$/)' )
+	docker-compose exec -T mysql sh -c 'cat > /root/.my.cnf' << EOS
+[client]
+user=root
+password=$MYSQL_ROOT_PASSWORD
+EOS
+}
+
+disable_mysql_root() {
+	docker-compose exec mysql rm /root/.my.cnf
+}
+
+do_init() {
+	generate_env
+}
+
+do_export() {
+	local dir_dest="$BASEDIR/var"
+	mkdir -p "$dir_dest"
+	local compose_project_name=$( get_project_name ) 
+	local volume_name=$compose_project_name'_wordpress'
+
+	docker run --rm -v $volume_name:/d busybox tar zcC /d . > "$dir_dest"'/wordpress.tar.gz'
+	echo "Export: $dir_dest"'/wordpress.tar.gz'
+
+	enable_mysql_root
+	docker-compose exec mysql mysqldump --opt $DB_NAME > "$dir_dest"'/wordpress.sql'
+	disable_mysql_root
+	echo "Export: $dir_dest"'/wordpress.sql'
+}
+
+do_import() {
+	local dir_dest="$BASEDIR/var"
+	local compose_project_name=$( get_project_name ) 
+	local volume_name=$compose_project_name'_wordpress'
+
+	docker run --rm -v $volume_name:/d busybox sh -c 'cd /d && rm -rf * && rm -rf .* 2> /dev/null || true'
+	echo "Import: $dir_dest"'/wordpress.tar.gz'
+	docker run --rm -i -v $volume_name:/d busybox tar zxpC /d < "$dir_dest"'/wordpress.tar.gz'
+
+	enable_mysql_root
+	eval $( cat "$ENV_FILENAME" | perl -nlE 'say "local $1=$2" if(/^([^=]+)=(.+)$/)' )
+	docker-compose exec -T mysql mysql $DB_NAME < "$dir_dest"'/wordpress.sql'
+
+	disable_mysql_root
+	echo "Import: $dir_dest"'/wordpress.sql'
+}
+
+run() {
+    for i in $COMMANDS; do
+    if [ "$i" == "${1:-}" ]; then
+        shift
+        do_$i $@
+        exit 0
+    fi
+    done
+    echo "USAGE: $( basename $0 ) COMMAND"
+    echo "COMMANDS:"
+    for i in $COMMANDS; do
+    echo "   $i"
+    done
+    exit 1
+}
+run $@
